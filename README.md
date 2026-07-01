@@ -112,3 +112,35 @@ The booking flow after login is driven by the live Civic Permits form structure:
 - `Submit`
 
 If Civic Permits changes labels or field layouts, update the helper locators in `src/book.js`.
+
+## C++ Version (Experimental)
+
+A standalone C++ client is available in `cpp/`.
+
+Build:
+
+```bash
+cd cpp
+cmake -S . -B build
+cmake --build build -j
+```
+
+Run in safe mode (no submit):
+
+```bash
+MODE=safe ./build/octagon_booker_cpp
+```
+
+Run in auto mode (requires auth cookie string):
+
+```bash
+MODE=auto CIVIC_COOKIE='name=value; name2=value2' ./build/octagon_booker_cpp
+```
+
+Behavior:
+
+- Tries +2 day plan first
+- Falls back to +1 day only if +2 day attempts all fail
+- Tries courts in priority order (Court 3 first)
+
+Note: the C++ path posts directly to `/Permits` using known response IDs/facility IDs and is provided as an experimental alternative to the Playwright flow.

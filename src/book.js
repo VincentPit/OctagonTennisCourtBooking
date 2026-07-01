@@ -4,6 +4,7 @@ import https from 'https';
 import { URL } from 'url';
 import { chromium } from 'playwright';
 import { loadConfig } from './config.js';
+import { refreshAuthState } from './auth.js';
 import { addOneHour, getReservationPlan, getReservationPlanForOffset } from './date-planner.js';
 import { notify } from './notify.js';
 import { submitPermitViaAPI } from './api.js';
@@ -550,7 +551,7 @@ async function bookViaDirectAPI(page, config, plannedDates, startTime, courtLabe
 
   // Build and stage the event group using site-native helpers so submit uses
   // the same internal model as manual form submission.
-  const stagedEventInfo = await page.evaluate(() => {
+  const stagedEventInfo = await page.evaluate(async () => {
     if (typeof window.getEventGroupInfo !== 'function' || typeof window.addEventGroup !== 'function') {
       return null;
     }
@@ -560,16 +561,58 @@ async function bookViaDirectAPI(page, config, plannedDates, startTime, courtLabe
       return null;
     }
 
+    // Native Civic availability check used by the date form flow.
+    const conflictResponse = await fetch('/Permits/ConflictCheck', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'X-Requested-With': 'XMLHttpRequest'
+      },
+      credentials: 'same-origin',
+      body: JSON.stringify(eventInfo)
+    });
+
+    if (!conflictResponse.ok) {
+      return {
+        facilityCount: eventInfo.FacilityIds.length,
+        dateCount: eventInfo.Dates.length,
+        eventInfo,
+        available: false,
+        conflictError: `Conflict check failed with HTTP ${conflictResponse.status}`
+      };
+    }
+
+    const conflicts = await conflictResponse.json().catch(() => []);
+    const hasConflicts = Array.isArray(conflicts) && conflicts.length > 0;
+    if (hasConflicts) {
+      return {
+        facilityCount: eventInfo.FacilityIds.length,
+        dateCount: eventInfo.Dates.length,
+        eventInfo,
+        available: false,
+        conflicts
+      };
+    }
+
     window.addEventGroup(eventInfo);
     return {
       facilityCount: eventInfo.FacilityIds.length,
       dateCount: eventInfo.Dates.length,
-      eventInfo
+      eventInfo,
+      available: true,
+      conflicts: []
     };
   });
 
   if (!stagedEventInfo || stagedEventInfo.facilityCount === 0 || stagedEventInfo.dateCount === 0) {
     throw new Error('Could not stage event info via native form helpers.');
+  }
+
+  if (!stagedEventInfo.available) {
+    if (stagedEventInfo.conflictError) {
+      throw new Error(stagedEventInfo.conflictError);
+    }
+    throw new Error(`Timeslot conflict detected for ${courtLabel} at ${startTime}; skipping submit.`);
   }
 
   console.log(`[BOOKING] Staged native event group: facilities=${stagedEventInfo.facilityCount}, dates=${stagedEventInfo.dateCount}`);
@@ -852,8 +895,10 @@ async function main() {
     return;
   }
 
+  await refreshAuthState(config);
+
   if (!(await fileExists(config.statePath))) {
-    throw new Error(`Missing auth state at ${config.statePath}. Run npm run bootstrap-login first.`);
+    throw new Error(`Missing auth state at ${config.statePath}. Set BOOKING_EMAIL and BOOKING_PASSWORD, then rerun.`);
   }
 
   const browser = await chromium.launch({ headless: config.headless });
