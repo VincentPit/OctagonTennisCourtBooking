@@ -1,0 +1,16 @@
+{
+  "name": "octagon-booker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Playwright automation for RIOC Octagon tennis court reservations.",
+  "scripts": {
+    "bootstrap-login": "node src/login.js",
+    "book": "node src/book.js",
+    "book:dry": "DRY_RUN=true MODE=safe node src/book.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "playwright": "^1.54.0"
+  }
+}
