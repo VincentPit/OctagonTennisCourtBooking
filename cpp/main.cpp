@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
+#include <future>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -20,7 +21,9 @@ struct Config {
   std::string statePath = ".auth/storage-state.json";
   std::string baseUrl = "https://rioc.civicpermits.com/Permits";
   std::string conflictUrl = "https://rioc.civicpermits.com/Permits/ConflictCheck";
-  std::string startTime = "20:00";
+  std::string weekdayStartTime = "19:00";
+  int weekendStartHour = 8;
+  int weekendEndHour = 21;
   std::string activity = "Tennis court reservation";
   bool fallbackEnabled = true;
 };
@@ -37,6 +40,17 @@ struct AttemptStats {
   int submitFailures = 0;
 };
 
+struct CourtOption {
+  std::string name;
+  std::string id;
+};
+
+enum class ConflictStatus {
+  Free,
+  Conflict,
+  Error
+};
+
 std::string getenvOr(const char* key, const std::string& fallback) {
   const char* value = std::getenv(key);
   if (!value) {
@@ -47,6 +61,24 @@ std::string getenvOr(const char* key, const std::string& fallback) {
 
 bool isTruthy(const std::string& value) {
   return value == "1" || value == "true" || value == "TRUE" || value == "yes" || value == "YES";
+}
+
+int clampInt(int value, int minValue, int maxValue) {
+  if (value < minValue) {
+    return minValue;
+  }
+  if (value > maxValue) {
+    return maxValue;
+  }
+  return value;
+}
+
+int parseIntOr(const std::string& text, int fallback) {
+  try {
+    return std::stoi(text);
+  } catch (...) {
+    return fallback;
+  }
 }
 
 std::string readFile(const std::string& path) {
@@ -98,7 +130,12 @@ Config loadConfig() {
   }
   config.baseUrl = getenvOr("BASE_URL_PERMITS", "https://rioc.civicpermits.com/Permits");
   config.conflictUrl = getenvOr("BASE_URL_CONFLICT_CHECK", "https://rioc.civicpermits.com/Permits/ConflictCheck");
-  config.startTime = getenvOr("PREFERRED_TIME", "20:00");
+  config.weekdayStartTime = getenvOr("WEEKDAY_TIME", "19:00");
+  config.weekendStartHour = clampInt(parseIntOr(getenvOr("WEEKEND_START_HOUR", "8"), 8), 0, 23);
+  config.weekendEndHour = clampInt(parseIntOr(getenvOr("WEEKEND_END_HOUR", "21"), 21), 0, 23);
+  if (config.weekendEndHour < config.weekendStartHour) {
+    config.weekendEndHour = config.weekendStartHour;
+  }
   config.activity = getenvOr("ACTIVITY", "Tennis court reservation");
   config.fallbackEnabled = isTruthy(getenvOr("ENABLE_FALLBACK_1D", "true"));
   return config;
@@ -191,6 +228,34 @@ std::string addOneHour(const std::string& hhmm) {
   std::ostringstream out;
   out << std::setfill('0') << std::setw(2) << nextHour << ":" << std::setw(2) << nextMinute;
   return out.str();
+}
+
+std::string hourToHHMM(int hour) {
+  std::ostringstream out;
+  out << std::setfill('0') << std::setw(2) << hour << ":00";
+  return out.str();
+}
+
+bool isWeekend(const std::tm& day) {
+  return day.tm_wday == 0 || day.tm_wday == 6;
+}
+
+std::vector<std::string> buildTimeSlotsForDay(const Config& config, const std::tm& day) {
+  if (!isWeekend(day)) {
+    return {config.weekdayStartTime};
+  }
+
+  std::vector<std::string> slots;
+  for (int hour = config.weekendStartHour; hour <= config.weekendEndHour; ++hour) {
+    if (hour == 23) {
+      continue;
+    }
+    slots.push_back(hourToHHMM(hour));
+  }
+  if (slots.empty()) {
+    slots.push_back(config.weekdayStartTime);
+  }
+  return slots;
 }
 
 size_t writeCallback(void* contents, size_t size, size_t nmemb, void* userp) {
@@ -311,25 +376,23 @@ std::string buildConflictCheckPayload(
   return out.str();
 }
 
-bool isConflictFree(const Config& config, const std::string& conflictPayload, bool* wasConflict) {
-  *wasConflict = false;
+ConflictStatus getConflictStatus(const Config& config, const std::string& conflictPayload) {
   HttpResult conflictCheck = postJson(config.conflictUrl, conflictPayload, config.cookie);
   std::cout << "Conflict check HTTP " << conflictCheck.status << "\n";
 
   if (conflictCheck.status < 200 || conflictCheck.status >= 300) {
     std::cout << "Conflict check failed; skipping this attempt: "
               << conflictCheck.body.substr(0, 200) << "\n";
-    return false;
+    return ConflictStatus::Error;
   }
 
   const std::regex emptyArrayPattern(R"(^\s*\[\s*\]\s*$)");
   if (!std::regex_match(conflictCheck.body, emptyArrayPattern)) {
-    *wasConflict = true;
     std::cout << "Timeslot already occupied according to ConflictCheck.\n";
-    return false;
+    return ConflictStatus::Conflict;
   }
 
-  return true;
+  return ConflictStatus::Free;
 }
 
 void runAttempt(const Config& config, int offsetDays, bool* submitted, AttemptStats* stats) {
@@ -337,40 +400,56 @@ void runAttempt(const Config& config, int offsetDays, bool* submitted, AttemptSt
   std::tm day = addDays(now, offsetDays);
   std::string isoDate = toIsoDate(day);
   std::string weekday = toWeekday(day);
+  const std::vector<std::string> timeSlots = buildTimeSlotsForDay(config, day);
 
   std::cout << "Plan (" << (offsetDays > 0 ? "+" : "") << offsetDays << "d): "
-            << weekday << " " << isoDate << " at " << config.startTime << "\n";
+            << weekday << " " << isoDate << " slots=" << timeSlots.size() << "\n";
 
-  const std::vector<std::pair<std::string, std::string>> courts = {
+  const std::vector<CourtOption> courts = {
       {"Octagon Tennis court 3", "9bdef00b-afa0-4b6b-bf9a-75899f7f97c7"},
       {"Octagon Tennis Court 1", "036dfea4-c487-47b0-b7fe-c9cbe52b7c98"},
       {"Octagon Tennis court 2", "175bdff8-016e-46ab-a9df-829fe40c0754"},
       {"Octagon Tennis Court 4", "d311851d-ce53-49fc-9662-42adcda26109"},
       {"Octagon Tennis Court 5", "8a5ca8e8-3be0-4145-a4ef-91a69671295b"},
       {"Octagon Tennis Court 6", "77c7f42c-8891-4818-a610-d5c1027c62fe"},
-  };
+    };
 
-  std::string endTime = addOneHour(config.startTime);
-  std::string startIso = buildDateTime(day, config.startTime);
-  std::string stopIso = buildDateTime(day, endTime);
+  for (const auto& slot : timeSlots) {
+    const std::string endTime = addOneHour(slot);
+    const std::string startIso = buildDateTime(day, slot);
+    const std::string stopIso = buildDateTime(day, endTime);
 
-  for (const auto& court : courts) {
-    stats->totalTrials += 1;
-    std::cout << "Attempting [" << (offsetDays > 0 ? "+" : "") << offsetDays << "d] "
-              << court.first << " " << startIso << "\n";
+    std::cout << "Checking slot " << slot << "-" << endTime << "\n";
 
-    std::string conflictPayload = buildConflictCheckPayload(court.first, court.second, startIso, stopIso);
-    bool wasConflict = false;
-    if (!isConflictFree(config, conflictPayload, &wasConflict)) {
-      if (wasConflict) {
+    std::vector<std::future<ConflictStatus>> conflictFutures;
+    conflictFutures.reserve(courts.size());
+
+    for (const auto& court : courts) {
+      stats->totalTrials += 1;
+      std::cout << "Attempting [" << (offsetDays > 0 ? "+" : "") << offsetDays << "d] "
+                << court.name << " " << startIso << "\n";
+
+      std::string conflictPayload = buildConflictCheckPayload(court.name, court.id, startIso, stopIso);
+      conflictFutures.push_back(std::async(std::launch::async, [config, conflictPayload]() {
+        return getConflictStatus(config, conflictPayload);
+      }));
+    }
+
+    std::vector<size_t> conflictFreeIndexes;
+    for (size_t i = 0; i < conflictFutures.size(); ++i) {
+      const ConflictStatus status = conflictFutures[i].get();
+      if (status == ConflictStatus::Free) {
+        conflictFreeIndexes.push_back(i);
+      } else if (status == ConflictStatus::Conflict) {
         stats->conflictTrials += 1;
       } else {
         stats->precheckErrors += 1;
       }
-      continue;
     }
 
-    std::string payload = buildPayload(config, court.first, court.second, startIso, stopIso);
+    if (conflictFreeIndexes.empty()) {
+      continue;
+    }
 
     if (config.mode == "safe") {
       std::cout << "SAFE MODE: would submit payload to " << config.baseUrl << "\n";
@@ -378,17 +457,49 @@ void runAttempt(const Config& config, int offsetDays, bool* submitted, AttemptSt
       return;
     }
 
-    HttpResult result = postJson(config.baseUrl, payload, config.cookie);
-    std::cout << "HTTP " << result.status << "\n";
+    struct SubmitResult {
+      size_t courtIndex;
+      HttpResult result;
+    };
 
-    if (result.status >= 200 && result.status < 300) {
-      std::cout << "Submitted successfully for " << court.first << "\n";
+    std::vector<std::future<SubmitResult>> submitFutures;
+    submitFutures.reserve(conflictFreeIndexes.size());
+    for (size_t idx : conflictFreeIndexes) {
+      submitFutures.push_back(std::async(std::launch::async, [config, &courts, idx, startIso, stopIso]() {
+        SubmitResult out{idx, {0, ""}};
+        const auto& court = courts[idx];
+        std::string payload = buildPayload(config, court.name, court.id, startIso, stopIso);
+        out.result = postJson(config.baseUrl, payload, config.cookie);
+        return out;
+      }));
+    }
+
+    int successCount = 0;
+    size_t winnerIndex = 0;
+    for (auto& future : submitFutures) {
+      SubmitResult submitResult = future.get();
+      std::cout << "HTTP " << submitResult.result.status << "\n";
+      if (submitResult.result.status >= 200 && submitResult.result.status < 300) {
+        successCount += 1;
+        winnerIndex = submitResult.courtIndex;
+      } else {
+        stats->submitFailures += 1;
+        std::cout << "Failed for " << courts[submitResult.courtIndex].name << ": "
+                  << submitResult.result.body.substr(0, 200) << "\n";
+      }
+    }
+
+    if (successCount > 0) {
+      const auto& winnerCourt = courts[winnerIndex];
+      std::cout << "Submitted successfully for " << winnerCourt.name << "\n";
+      std::string successMessage = "Booked " + winnerCourt.name + " on " + isoDate + " at " + slot + ".";
+      if (successCount > 1) {
+        successMessage += " Multiple court submissions succeeded; review permits.";
+      }
+      sendMacNotification("Octagon Booker", successMessage);
       *submitted = true;
       return;
     }
-
-    stats->submitFailures += 1;
-    std::cout << "Failed for " << court.first << ": " << result.body.substr(0, 200) << "\n";
   }
 }
 

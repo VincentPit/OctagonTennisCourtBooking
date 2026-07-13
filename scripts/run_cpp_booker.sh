@@ -1,31 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CPP_DIR="${PROJECT_DIR}/cpp"
-BUILD_DIR="${CPP_DIR}/build"
-BINARY="${BUILD_DIR}/octagon_booker_cpp"
-NODE_BIN="${NODE_BIN:-/Users/stephenlee/.nvm/versions/node/v20.12.0/bin/node}"
-NPM_BIN="${NPM_BIN:-/Users/stephenlee/.nvm/versions/node/v20.12.0/bin/npm}"
-CMAKE_BIN="${CMAKE_BIN:-/opt/homebrew/bin/cmake}"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BINARY="${PROJECT_DIR}/cpp/build/octagon_booker_cpp"
 
-if [[ ! -d "${PROJECT_DIR}/node_modules" ]]; then
-  "$NPM_BIN" install --no-fund --no-audit
+# Track daily bookings - one per day max
+DAILY_BOOKING_FLAG="/tmp/octagon_booker_$(date +%Y%m%d).flag"
+if [[ -f "$DAILY_BOOKING_FLAG" ]]; then
+  exit 0
 fi
 
-"$NODE_BIN" "${PROJECT_DIR}/src/login.js"
-
+# Binary reads cookies directly from storage state file
 cd "$PROJECT_DIR"
-COOKIE_HEADER="$("$NODE_BIN" -e 'const fs=require("fs"); const statePath=process.env.STATE_PATH || ".auth/storage-state.json"; const raw=fs.readFileSync(statePath,"utf8"); const data=JSON.parse(raw); const cookie=(data.cookies||[]).map((c)=>`${c.name}=${c.value}`).join("; "); process.stdout.write(cookie);')"
-if [[ -z "$COOKIE_HEADER" ]]; then
-  echo "[AUTH] No cookies found in ${STATE_PATH:-.auth/storage-state.json} after refresh." >&2
-  exit 2
-fi
+OUTPUT=$("$BINARY" 2>&1)
+echo "$OUTPUT"
 
-if [[ ! -x "$BINARY" ]]; then
-  "$CMAKE_BIN" -S "$CPP_DIR" -B "$BUILD_DIR"
-  "$CMAKE_BIN" --build "$BUILD_DIR" -j
+# Check if booking was successful
+if echo "$OUTPUT" | grep -q "Submitted successfully for"; then
+  touch "$DAILY_BOOKING_FLAG"
+  BOOKINGS=$(echo "$OUTPUT" | grep "Submitted successfully for" | sed 's/.*Submitted successfully for //' | sort | uniq)
+  DATE=$(echo "$OUTPUT" | grep "^Plan" | head -1 | sed 's/.*: //' | cut -d' ' -f1-2)
+  TIME=$(echo "$OUTPUT" | grep "Checking slot" | head -1 | sed 's/.*Checking slot //' | cut -d'-' -f1)
+  COURTS=$(echo "$BOOKINGS" | tr '\n' ', ' | sed 's/,$//')
+  osascript -e "display notification \"${DATE} at ${TIME}\\n${COURTS}\" with title \"🎾 Courts Booked!\""
 fi
-
-exec env CIVIC_COOKIE="$COOKIE_HEADER" "$BINARY"
